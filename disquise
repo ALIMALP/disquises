@@ -1,0 +1,195 @@
+package me.ALIMALP.disguise
+
+import com.comphenix.protocol.PacketType
+import com.comphenix.protocol.ProtocolLibrary
+import com.comphenix.protocol.events.PacketAdapter
+import com.comphenix.protocol.events.PacketContainer
+import com.comphenix.protocol.events.PacketEvent
+import com.comphenix.protocol.wrappers.EnumWrappers
+import com.comphenix.protocol.wrappers.PlayerInfoData
+import com.comphenix.protocol.wrappers.WrappedChatComponent
+import com.comphenix.protocol.wrappers.WrappedGameProfile
+import com.comphenix.protocol.wrappers.WrappedSignedProperty
+import com.destroystokyo.paper.profile.PlayerProfile
+import org.bukkit.command.Command
+import org.bukkit.command.CommandSender
+import org.bukkit.entity.Player
+import org.bukkit.event.EventHandler
+import org.bukkit.event.Listener
+import org.bukkit.event.player.PlayerJoinEvent
+import org.bukkit.plugin.java.JavaPlugin
+import java.util.UUID
+
+@Suppress("UNUSED")
+class NickPlugin : JavaPlugin(), Listener {
+	private val names = mutableMapOf<UUID, String>()
+
+	override fun onEnable() {
+		ProtocolLibrary.getProtocolManager().addPacketListener(
+			object : PacketAdapter(this, PacketType.Play.Server.NAMED_ENTITY_SPAWN) {
+				override fun onPacketSending(event: PacketEvent) {
+					val uuid = event.packet.uuiDs.read(0)
+					val profile = getEffectiveProfile(server.getPlayer(uuid)!!)
+					event.packet.uuiDs.write(0, profile.id)
+				}
+			},
+		)
+		ProtocolLibrary.getProtocolManager().addPacketListener(
+			object : PacketAdapter(this, PacketType.Play.Server.PLAYER_INFO) {
+				override fun onPacketSending(event: PacketEvent) {
+					val dataList = event.packet.playerInfoDataLists.read(0)
+					for (i in dataList.indices) {
+						val data = dataList[i]
+						val player = server.getPlayer(data.profile.uuid) ?: continue
+						val profile = getEffectiveProfile(player)
+						val wrappedProfile = if (event.player == player) {
+							WrappedGameProfile(player.uniqueId, profile.name)
+						} else {
+							WrappedGameProfile(profile.id, profile.name)
+						}
+						for (property in profile.properties) {
+							wrappedProfile.properties.put(
+								property.name,
+								WrappedSignedProperty(
+									property.name,
+									property.value,
+									property.signature,
+								),
+							)
+						}
+						dataList[i] = PlayerInfoData(
+							wrappedProfile,
+							data.latency,
+							data.gameMode,
+							WrappedChatComponent.fromText(wrappedProfile.name),
+						)
+					}
+					event.packet.playerInfoDataLists.write(0, dataList)
+					Unit
+				}
+			},
+		)
+
+		server.pluginManager.registerEvents(this, this)
+	}
+
+	private fun getOfflineProfile(name: String) =
+		server.createProfile(UUID.nameUUIDFromBytes("OfflinePlayer:$name".toByteArray()), name)
+
+	private fun getEffectiveProfile(player: Player): PlayerProfile {
+		val effectiveName = names.getOrDefault(player.uniqueId, player.name)
+		val profile = server.createProfile(effectiveName)
+		profile.complete()
+		profile.id ?: return getOfflineProfile(effectiveName)
+		return profile
+	}
+
+	private fun nick(player: Player, name: String) {
+		names[player.uniqueId] = name
+		refresh(player)
+	}
+
+	private val playerPreviousIdentities = mutableMapOf<Player, WrappedGameProfile>()
+	private fun refresh(player: Player) {
+		// REMOVE PLAYER FOR OTHERS
+		run {
+			val previous = playerPreviousIdentities.remove(player)
+				?: WrappedGameProfile(player.uniqueId, player.name)
+
+			val profile = getEffectiveProfile(player)
+			playerPreviousIdentities[player] = WrappedGameProfile(profile.id, profile.name)
+
+			val packet = PacketContainer(PacketType.Play.Server.PLAYER_INFO)
+			packet.playerInfoAction.write(0, EnumWrappers.PlayerInfoAction.REMOVE_PLAYER)
+			packet.playerInfoDataLists.write(
+				0,
+				listOf(
+					PlayerInfoData(
+						previous,
+						0,
+						EnumWrappers.NativeGameMode.SURVIVAL,
+						null,
+					),
+				),
+			)
+			for (p in server.onlinePlayers) {
+				if (p != player) {
+					ProtocolLibrary.getProtocolManager().sendServerPacket(p, packet.deepClone(), false)
+				}
+			}
+		}
+
+		// REMOVE PLAYER FOR SELF
+		run {
+			val packet = PacketContainer(PacketType.Play.Server.PLAYER_INFO)
+			packet.playerInfoAction.write(0, EnumWrappers.PlayerInfoAction.REMOVE_PLAYER)
+			packet.playerInfoDataLists.write(
+				0,
+				listOf(
+					PlayerInfoData(
+						WrappedGameProfile(player.uniqueId, player.name),
+						0,
+						EnumWrappers.NativeGameMode.SURVIVAL,
+						null,
+					),
+				),
+			)
+			ProtocolLibrary.getProtocolManager().sendServerPacket(player, packet, false)
+		}
+
+		// ADD PLAYER FOR EVERYONE
+		run {
+			val packet = PacketContainer(PacketType.Play.Server.PLAYER_INFO)
+			packet.playerInfoAction.write(0, EnumWrappers.PlayerInfoAction.ADD_PLAYER)
+			packet.playerInfoDataLists.write(
+				0,
+				listOf(
+					PlayerInfoData(
+						WrappedGameProfile(player.uniqueId, player.name),
+						player.ping,
+						EnumWrappers.NativeGameMode.fromBukkit(player.gameMode),
+						WrappedChatComponent.fromText(player.name),
+					),
+				),
+			)
+			for (p in server.onlinePlayers) {
+				ProtocolLibrary.getProtocolManager().sendServerPacket(p, packet.deepClone())
+			}
+		}
+
+		// RESPAWN FOR SELF
+		run {
+			server.worlds.firstOrNull { it != player.world }?.let {
+				val location = player.location
+				player.teleport(it.spawnLocation)
+				player.teleport(location)
+			}
+		}
+
+		for (p in server.onlinePlayers) {
+			p.hidePlayer(this, player)
+			p.showPlayer(this, player)
+		}
+	}
+
+	@EventHandler
+	fun onPlayerJoin(event: PlayerJoinEvent) {
+		refresh(event.player)
+	}
+
+	override fun onCommand(sender: CommandSender, command: Command, label: String, args: Array<out String>): Boolean {
+		if (command.name == "disguise") {
+			if (sender !is Player) {
+				sender.sendMessage("You must be a player to execute this command.")
+				return true
+			}
+			if (args.isEmpty()) {
+				sender.sendMessage("Please specify a nickname to use.")
+				return true
+			}
+		disguise(sender, args.first())
+			return true
+		}
+		return false
+	}
+}
